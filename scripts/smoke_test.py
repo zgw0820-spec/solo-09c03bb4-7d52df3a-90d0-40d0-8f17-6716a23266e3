@@ -10,6 +10,7 @@ It exercises the paths that are hard to see in unit tests:
   2. submit -> escalate exactly once
   3. slow gateway: unknown receipt must not escalate; recovery must not double-page
   4. dropped receipt: gateway accepted, API must resolve via lookup, not re-post
+  5. claim by notification number, backup takeover, credential invalidation
 
 Exits non-zero on the first violated assertion. Run it with -I.
 """
@@ -139,6 +140,73 @@ def main() -> int:
     notification_no = view["notifications"][0]["notification_no"]
     status, single = call("GET", f"{API}/notifications/{notification_no}")
     check(status == 200 and single["notification_no"] == notification_no, "lookup by notification number")
+
+    print("[6] claim, takeover and credential gating")
+    _, view = call("GET", f"{API}/alarms/{RUN}-CONFIRM")
+    confirmed_primary = view["notifications"][0]["notification_no"]
+    late_claim = call(
+        "POST",
+        f"{API}/alarms/{RUN}-CONFIRM/notifications/{confirmed_primary}/claim",
+        {"claimed_by": "张工"},
+    )
+    check(late_claim[0] == 409, "a confirmed alarm cannot be claimed")
+
+    # Fresh alarm: primary claims, then the backup takes over after escalation.
+    status, body = call("POST", f"{API}/alarms", payload(f"{RUN}-CLAIM", 2))
+    check(status == 201, "claim demo alarm submitted")
+    view = wait_for(f"{RUN}-CLAIM", lambda v: v["status"] == "awaiting_confirmation")
+    primary_no = view["notifications"][0]["notification_no"]
+    status, primary_claim = call(
+        "POST", f"{API}/alarms/{RUN}-CLAIM/notifications/{primary_no}/claim",
+        {"claimed_by": "主值班员 张工"},
+    )
+    check(status == 201 and primary_claim["claim_token"], "primary claim registered")
+    status, again = call(
+        "POST", f"{API}/alarms/{RUN}-CLAIM/notifications/{primary_no}/claim",
+        {"claimed_by": "主值班员 张工"},
+    )
+    check(
+        status == 200
+        and again["reused"] is True
+        and again["claim_token"] == primary_claim["claim_token"],
+        "repeating the same claim reuses the credential",
+    )
+    status, body = call(
+        "POST", f"{API}/alarms/{RUN}-CLAIM/confirm", {"confirmed_by": "张工"}
+    )
+    check(status == 403, "a claimed alarm refuses confirmation without the credential")
+
+    view = wait_for(f"{RUN}-CLAIM", lambda v: v["status"] == "escalated")
+    backup_no = next(n["notification_no"] for n in view["notifications"] if n["role"] == "backup")
+    wait_for(
+        f"{RUN}-CLAIM",
+        lambda v: any(
+            n["notification_no"] == backup_no and n["state"] == "accepted"
+            for n in v["notifications"]
+        ),
+    )
+    status, backup_claim = call(
+        "POST", f"{API}/alarms/{RUN}-CLAIM/notifications/{backup_no}/claim",
+        {"claimed_by": "备班 李工"},
+    )
+    check(status == 201 and backup_claim["role"] == "backup", "backup took over the alarm")
+    status, _ = call(
+        "POST", f"{API}/alarms/{RUN}-CLAIM/confirm",
+        {"confirmed_by": "主班", "claim_token": primary_claim["claim_token"]},
+    )
+    check(status == 403, "the invalidated primary credential can no longer confirm")
+    status, _ = call(
+        "POST", f"{API}/alarms/{RUN}-CLAIM/confirm",
+        {"confirmed_by": "备班", "claim_token": backup_claim["claim_token"]},
+    )
+    check(status == 200, "the current holder can confirm")
+    _, view = call("GET", f"{API}/alarms/{RUN}-CLAIM")
+    check(view["taken_over"] is True and view["claimed_by"] == "备班 李工", "status shows the handler")
+    check(
+        primary_claim["claim_token"] not in json.dumps(view)
+        and backup_claim["claim_token"] not in json.dumps(view),
+        "status queries never expose claim credentials",
+    )
 
     print("smoke test passed")
     return 0

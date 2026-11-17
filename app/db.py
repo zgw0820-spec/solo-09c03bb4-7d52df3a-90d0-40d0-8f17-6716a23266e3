@@ -95,6 +95,36 @@ CREATE TABLE IF NOT EXISTS events (
     kind        TEXT NOT NULL,
     detail      TEXT
 );
+
+-- Ownership claims. A claim is only valid for a notification the gateway has
+-- confirmed as accepted, and it is keyed by (alarm_no, notification_no).
+-- ``token`` is the bearer credential used to confirm; it is deliberately never
+-- selected into an operator-facing view.
+CREATE TABLE IF NOT EXISTS claims (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    alarm_no            TEXT NOT NULL REFERENCES alarms(alarm_no),
+    notification_no     TEXT NOT NULL,
+    role                TEXT NOT NULL CHECK (role IN ('primary', 'backup')),
+    claimed_by          TEXT NOT NULL,
+    token               TEXT NOT NULL UNIQUE,
+    -- active      : the holder may confirm with this token
+    -- invalidated : a backup takeover replaced this claim; its token is dead
+    state               TEXT NOT NULL CHECK (state IN ('active', 'invalidated')),
+    created_at          TEXT NOT NULL,
+    created_real        REAL NOT NULL,
+    invalidated_at      TEXT,
+    invalidated_real    REAL,
+    invalidated_reason  TEXT
+);
+
+-- At most one live claim per alarm, and at most one claim row per notification
+-- (re-claiming the same notification returns the existing token).
+CREATE UNIQUE INDEX IF NOT EXISTS ux_claims_active_alarm
+    ON claims(alarm_no) WHERE state = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS ux_claims_notification
+    ON claims(notification_no);
+CREATE INDEX IF NOT EXISTS ix_claims_alarm
+    ON claims(alarm_no);
 """
 
 

@@ -44,6 +44,19 @@ def _load(raw: str | None, default: Any) -> Any:
         return default
 
 
+def _claim_view(row: dict[str, Any]) -> dict[str, Any]:
+    """Operator-facing claim. The bearer token is deliberately never included."""
+    return {
+        "role": row["role"],
+        "claimed_by": row["claimed_by"],
+        "notification_no": row["notification_no"],
+        "claimed_at": row["created_at"],
+        "active": row["state"] == "active",
+        "invalidated_at": row.get("invalidated_at"),
+        "invalidated_reason": row.get("invalidated_reason"),
+    }
+
+
 def _notification_view(row: dict[str, Any], confirmed_at: str | None) -> dict[str, Any]:
     state = row["state"]
     display, display_text = NOTIFICATION_DISPLAY.get(state, (state, state))
@@ -82,9 +95,11 @@ def build_alarm_view(
     alarm: dict[str, Any],
     notifications: list[dict[str, Any]],
     events: list[dict[str, Any]],
+    claims: list[dict[str, Any]] | None = None,
     *,
     now_real: float,
 ) -> dict[str, Any]:
+    claims = claims or []
     by_role = {n["role"]: n for n in notifications}
     primary = by_role.get("primary")
     backup = by_role.get("backup")
@@ -139,6 +154,19 @@ def build_alarm_view(
     if backup is not None and backup["state"] == "failed":
         warnings.append("网关拒收备班通知，升级投递失败，需人工通知备班。")
 
+    active_claim = next((c for c in claims if c["state"] == "active"), None)
+    if active_claim is not None and not confirmed:
+        if active_claim["role"] == "backup":
+            warnings.append(
+                f"当前处置人：{active_claim['claimed_by']}（备班接手）；"
+                "主班原认领凭据已失效，不能再确认。"
+            )
+        else:
+            warnings.append(
+                f"当前处置人：{active_claim['claimed_by']}（主班认领）；"
+                "确认需使用其认领凭据。"
+            )
+
     seconds_until: float | None = None
     if (
         alarm.get("primary_ack_deadline_real") is not None
@@ -163,6 +191,12 @@ def build_alarm_view(
         "confirmed": confirmed,
         "confirmed_at": alarm.get("confirmed_at"),
         "confirmed_by": alarm.get("confirmed_by"),
+        "claimed": active_claim is not None,
+        "claim_role": active_claim["role"] if active_claim is not None else None,
+        "claimed_by": active_claim["claimed_by"] if active_claim is not None else None,
+        "claimed_at": active_claim["created_at"] if active_claim is not None else None,
+        "taken_over": active_claim is not None and active_claim["role"] == "backup",
+        "claims": [_claim_view(c) for c in claims],
         "escalated": escalated,
         "escalated_at": alarm.get("escalated_at"),
         "notifications": [

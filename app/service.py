@@ -31,7 +31,11 @@ from .view import build_alarm_view
 
 
 class ConflictError(Exception):
-    """Same alarm number, different content."""
+    """Same alarm number, different content; or a claim not allowed in this state."""
+
+
+class ForbiddenError(Exception):
+    """Confirmation rejected because the claim credential is missing or stale."""
 
 
 class NotFoundError(Exception):
@@ -197,14 +201,51 @@ class AlarmService:
 
     # ----------------------------------------------------------------- confirm
 
-    def confirm(self, alarm_no: str, confirmed_by: str, note: str | None) -> dict[str, Any]:
-        """Confirm an alarm and atomically prevent any new backup delivery."""
+    @staticmethod
+    def _live_claim(conn, alarm_no: str):
+        return conn.execute(
+            "SELECT * FROM claims WHERE alarm_no = ? AND state = 'active'", (alarm_no,)
+        ).fetchone()
+
+    def confirm(
+        self,
+        alarm_no: str,
+        confirmed_by: str,
+        note: str | None,
+        claim_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Confirm an alarm and atomically prevent any new backup delivery.
+
+        Confirmation is credential-gated only when the alarm has been claimed.
+        Unclaimed alarms keep the original behaviour (no credential). Once any
+        claim exists, only the *current* token may confirm: a stale token from a
+        before-takeover claim is rejected, so the previous handler cannot keep
+        acknowledging after the backup has taken over.
+        """
         now = utc_now()
         now_real = parse_ts(now)
         with self.db.transaction() as conn:
             alarm = conn.execute("SELECT * FROM alarms WHERE alarm_no = ?", (alarm_no,)).fetchone()
             if alarm is None:
                 raise NotFoundError(alarm_no)
+
+            live_claim = self._live_claim(conn, alarm_no)
+            ever_claimed = conn.execute(
+                "SELECT 1 FROM claims WHERE alarm_no = ? LIMIT 1", (alarm_no,)
+            ).fetchone() is not None
+            if live_claim is not None:
+                if claim_token is None:
+                    raise ForbiddenError("this alarm has been claimed; claim_token is required")
+                # Compare as bytes: a client may send arbitrary text, and the
+                # string form of compare_digest rejects non-ASCII input.
+                if not secrets.compare_digest(
+                    claim_token.encode("utf-8"), live_claim["token"].encode("ascii")
+                ):
+                    raise ForbiddenError("claim_token is not the current claim for this alarm")
+            elif ever_claimed:
+                # Ownership history without a live owner should be impossible;
+                # refuse rather than silently fall back to the unclaimed path.
+                raise ForbiddenError("claim_token has been invalidated")
 
             if alarm["confirmed_at"] is not None:
                 # Idempotent repeat confirmation: report the stored result.
@@ -270,6 +311,143 @@ class AlarmService:
                 ),
             )
             return self._snapshot(conn, alarm_no, now_real)
+
+    # ------------------------------------------------------------------- claim
+
+    def claim(
+        self,
+        alarm_no: str,
+        notification_no: str,
+        claimed_by: str,
+        note: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Register the handler for a delivered notification.
+
+        Returns ``(claim, reused)``. Rules, all arbitrated inside one write
+        transaction against committed state:
+
+        * The referenced notification must belong to the alarm and must have
+          been *accepted* by the gateway. An ambiguous receipt cannot be used to
+          take ownership, because the page may never have reached anyone.
+        * A confirmed alarm cannot be claimed or taken over.
+        * Claiming the same notification again returns the existing credential
+          (idempotent), unless that claim has been invalidated by a takeover.
+        * A backup claim on an accepted backup notification takes over: the
+          current claim is invalidated in the same transaction, so its token
+          stops working immediately. After a takeover the primary cannot claim
+          again.
+        """
+        now = utc_now()
+        now_real = parse_ts(now)
+        with self.db.transaction() as conn:
+            alarm = conn.execute("SELECT * FROM alarms WHERE alarm_no = ?", (alarm_no,)).fetchone()
+            if alarm is None:
+                raise NotFoundError(f"alarm {alarm_no!r} not found")
+
+            notification = conn.execute(
+                "SELECT * FROM notifications WHERE alarm_no = ? AND notification_no = ?",
+                (alarm_no, notification_no),
+            ).fetchone()
+            if notification is None:
+                raise NotFoundError(
+                    f"notification {notification_no!r} does not belong to alarm {alarm_no!r}"
+                )
+
+            if notification["state"] != "accepted":
+                raise ConflictError(
+                    "notification has not been accepted by the gateway; "
+                    "a claim is only allowed after delivery is confirmed"
+                )
+            if alarm["confirmed_at"] is not None:
+                raise ConflictError("alarm is already confirmed; it can no longer be claimed")
+
+            live_claim = self._live_claim(conn, alarm_no)
+            existing_for_notification = conn.execute(
+                "SELECT * FROM claims WHERE notification_no = ?", (notification_no,)
+            ).fetchone()
+
+            if existing_for_notification is not None:
+                if existing_for_notification["state"] == "active":
+                    # Same notification, repeated claim: reuse the credential.
+                    return (
+                        self._claim_payload(existing_for_notification, reused=True),
+                        True,
+                    )
+                raise ConflictError(
+                    "this notification's claim has been invalidated by a backup takeover"
+                )
+
+            role = notification["role"]
+            if role == "primary" and live_claim is not None and live_claim["role"] == "backup":
+                raise ConflictError(
+                    "the backup has taken over this alarm; the primary can no longer claim"
+                )
+            if live_claim is not None and live_claim["role"] == role:
+                raise ConflictError(
+                    f"alarm is already claimed through the {role} notification by "
+                    f"{live_claim['claimed_by']!r}"
+                )
+
+            token = secrets.token_urlsafe(32)
+            if live_claim is not None:
+                # Only a backup notification can reach here with a live claim,
+                # and only when the claim belongs to the primary: this is the
+                # takeover. Invalidate the old credential atomically.
+                conn.execute(
+                    """
+                    UPDATE claims
+                       SET state = 'invalidated', invalidated_at = ?, invalidated_real = ?,
+                           invalidated_reason = ?
+                     WHERE id = ? AND state = 'active'
+                    """,
+                    (
+                        now,
+                        now_real,
+                        f"taken over by backup claim {notification_no} ({claimed_by})",
+                        live_claim["id"],
+                    ),
+                )
+                self._event(
+                    conn,
+                    alarm_no,
+                    "claim_invalidated",
+                    f"{live_claim['notification_no']} claimed by {live_claim['claimed_by']!r} "
+                    f"invalidated; backup {notification_no} taken over by {claimed_by!r}",
+                )
+
+            conn.execute(
+                """
+                INSERT INTO claims (
+                    alarm_no, notification_no, role, claimed_by, token, state,
+                    created_at, created_real
+                ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (alarm_no, notification_no, role, claimed_by, token, now, now_real),
+            )
+            claim = conn.execute(
+                "SELECT * FROM claims WHERE notification_no = ?", (notification_no,)
+            ).fetchone()
+            self._event(
+                conn,
+                alarm_no,
+                "claimed",
+                f"{role} notification {notification_no} claimed by {claimed_by!r}"
+                + (" (took over from previous handler)" if live_claim is not None else "")
+                + (f": {note}" if note else ""),
+            )
+            return self._claim_payload(claim, reused=False), False
+
+    @staticmethod
+    def _claim_payload(claim, *, reused: bool) -> dict[str, Any]:
+        return {
+            "alarm_no": claim["alarm_no"],
+            "notification_no": claim["notification_no"],
+            "role": claim["role"],
+            "claimed_by": claim["claimed_by"],
+            "claimed_at": claim["created_at"],
+            "claim_token": claim["token"],
+            "reused": reused,
+        }
 
     # ---------------------------------------------------------------- deadline
 
@@ -541,9 +719,13 @@ class AlarmService:
         events = q(
             "SELECT at, kind, detail FROM events WHERE alarm_no = ? ORDER BY id", (alarm_no,)
         )
+        claims = q(
+            "SELECT * FROM claims WHERE alarm_no = ? ORDER BY id", (alarm_no,)
+        )
         return build_alarm_view(
             dict(alarm),
             [dict(n) for n in notifications],
             [dict(e) for e in events],
+            [dict(c) for c in claims],
             now_real=now_real,
         )

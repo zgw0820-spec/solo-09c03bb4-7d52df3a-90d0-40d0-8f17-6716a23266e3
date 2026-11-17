@@ -72,11 +72,67 @@ class AlarmCreate(BaseModel):
 class ConfirmRequest(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
-        json_schema_extra={"example": {"confirmed_by": "主值班员 张工", "note": "已到现场处理"}},
+        json_schema_extra={
+            "examples": [
+                {"confirmed_by": "主值班员 张工", "note": "已到现场处理"},
+                {
+                    "confirmed_by": "备班 李工",
+                    "note": "已接手处理",
+                    "claim_token": "claim-token-returned-by-the-claim-endpoint",
+                },
+            ]
+        },
     )
 
     confirmed_by: str = Field(default="primary", min_length=1, max_length=200)
     note: str | None = Field(default=None, max_length=500)
+    claim_token: str | None = Field(
+        default=None,
+        max_length=200,
+        description=(
+            "Claim credential. Required (and must be the current one) once the alarm "
+            "has been claimed; omit it for alarms that were never claimed."
+        ),
+    )
+
+
+class ClaimRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {"claimed_by": "主值班员 张工", "note": "已到现场处置"}
+        },
+    )
+
+    claimed_by: str = Field(min_length=1, max_length=200, description="Person taking ownership")
+    note: str | None = Field(default=None, max_length=500)
+
+
+class ClaimView(BaseModel):
+    role: Literal["primary", "backup"]
+    claimed_by: str
+    notification_no: str
+    claimed_at: str
+    active: bool
+    invalidated_at: str | None = None
+    invalidated_reason: str | None = None
+
+
+class ClaimResponse(BaseModel):
+    alarm_no: str
+    notification_no: str
+    role: Literal["primary", "backup"]
+    claimed_by: str
+    claimed_at: str
+    claim_token: str = Field(
+        description=(
+            "Bearer credential for confirmation. Returned only when claiming (and when "
+            "the same notification is claimed again); never exposed by status queries."
+        )
+    )
+    reused: bool = Field(
+        description="True when an identical re-claim returned the existing credential"
+    )
 
 
 class NotificationView(BaseModel):
@@ -124,6 +180,14 @@ class AlarmView(BaseModel):
     confirmed: bool
     confirmed_at: str | None = None
     confirmed_by: str | None = None
+    # Who currently owns the alarm (if claimed) and whether they took over from
+    # the primary. The credential itself is never included.
+    claimed: bool = False
+    claim_role: Literal["primary", "backup"] | None = None
+    claimed_by: str | None = None
+    claimed_at: str | None = None
+    taken_over: bool = False
+    claims: list[ClaimView] = Field(default_factory=list)
     escalated: bool
     escalated_at: str | None = None
     notifications: list[NotificationView] = Field(default_factory=list)

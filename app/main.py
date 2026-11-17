@@ -17,12 +17,14 @@ from .gateway_client import GatewayClient
 from .models import (
     AlarmCreate,
     AlarmView,
+    ClaimRequest,
+    ClaimResponse,
     ConfirmRequest,
     HealthView,
     NotificationList,
     NotificationView,
 )
-from .service import AlarmService, ConflictError, NotFoundError
+from .service import AlarmService, ConflictError, ForbiddenError, NotFoundError
 from .worker import Dispatcher
 
 log = logging.getLogger("alarm")
@@ -179,19 +181,75 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         summary="确认告警",
         description=(
             "确认后不再创建新的备班投递。若到期处理已生成备班通知但尚未发送，会在同一"
-            "事务内取消；若备班通知已在途，则不会撤回，并在查询结果中如实显示其最终受理情况。"
+            "事务内取消；若备班通知已在途，则不会撤回，并在查询结果中如实显示其最终受理情况。\n\n"
+            "告警一旦被认领，确认必须携带当前有效的 `claim_token`；备班接手后主班旧凭据"
+            "立即失效，不能再确认。未认领的告警沿用原有确认方式（无需凭据）。"
         ),
-        responses={404: {"description": "告警不存在"}},
+        responses={
+            403: {"description": "告警已被认领：凭据缺失、错误或已失效"},
+            404: {"description": "告警不存在"},
+        },
     )
     async def confirm_alarm(alarm_no: str, payload: ConfirmRequest, request: Request) -> dict:
         service: AlarmService = request.app.state.service
         try:
-            view = service.confirm(alarm_no, payload.confirmed_by, payload.note)
+            view = service.confirm(
+                alarm_no, payload.confirmed_by, payload.note, claim_token=payload.claim_token
+            )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"alarm {alarm_no!r} not found") from exc
+        except ForbiddenError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
         # Deliberately no gateway reconciliation here: confirmation must stay
         # fast and must not wait on a slow notification gateway.
         return view
+
+    @app.post(
+        "/alarms/{alarm_no}/notifications/{notification_no}/claim",
+        response_model=ClaimResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["告警"],
+        summary="按告警号和通知号认领处置",
+        description=(
+            "登记当前处置人。只有网关**确已受理**的通知才能用于认领：回执不明时不能认领。\n\n"
+            "- 主通知确已受理 → 登记主班联系人。\n"
+            "- 备班通知确已受理 → 登记备班联系人并接手：同一事务内使旧认领凭据失效，"
+            "此后主班不能再认领。\n"
+            "- 同一通知重复认领 → 沿用原凭据（`reused=true`，响应 200）。\n"
+            "- 已确认的告警不能再被认领或接手。\n\n"
+            "响应中的 `claim_token` 是确认凭据，仅在认领时返回一次；查询接口不会泄露它。"
+        ),
+        responses={
+            200: {"description": "同一通知的幂等重复认领，返回原凭据"},
+            404: {"description": "告警或通知不存在（通知必须属于该告警）"},
+            409: {"description": "通知尚未被网关受理、告警已确认、或接手方已生效"},
+        },
+    )
+    async def claim_alarm_notification(
+        alarm_no: str,
+        notification_no: str,
+        payload: ClaimRequest,
+        request: Request,
+        response: Response,
+    ) -> dict:
+        service: AlarmService = request.app.state.service
+        # Resolve an ambiguous receipt *before* judging the claim: the lookup is
+        # read-only (never re-posts), and the claim itself still requires the
+        # committed state to say "accepted". A still-unknown receipt is refused.
+        await _reconcile(request, alarm_no)
+        try:
+            claim, reused = service.claim(
+                alarm_no, notification_no, payload.claimed_by, payload.note
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except ForbiddenError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        if reused:
+            response.status_code = status.HTTP_200_OK
+        return claim
 
     @app.get(
         "/alarms/{alarm_no}/notifications",
